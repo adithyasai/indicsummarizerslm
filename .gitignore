@@ -198,4 +198,41 @@ production_config.json
 # Ignore UI
 /ui/
 
-# Ignore anything else you want to keep out of git
+# Ignore large data/model files and all .jsonl/.jsonl.gz
+*.jsonl
+*.jsonl.gz
+*.tar
+*.tar.gz
+*.zip
+*.7z
+*.rar
+*.bin
+*.weights
+*.pb
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.h5
+*.tflite
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.sav
+*.joblib
+*.model
+*.dat
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.arrow
+*.rds
+*.db
+*.sqlite*
+
+# Ignore all files in training_data and subfolders
+/training_data/
