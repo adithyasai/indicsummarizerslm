@@ -187,8 +187,7 @@ QUICK_REFERENCE.md
 # Ignore requirements
 requirements.txt
 
-# Ignore README and docs
-README.md
+# Ignore docs (but keep README.md)
 /docs/
 
 # Ignore config
