@@ -65,6 +65,8 @@ class StateOfTheArtIndicSummarizer:
         self.indicbart_available = False
         self.mt5_available = False
         self.sentence_transformer_available = False
+        self.neural_model_available = False
+        self.custom_tokenizer = None
         
         # Initialize models
         self._load_models()
@@ -155,7 +157,7 @@ class StateOfTheArtIndicSummarizer:
         self.important_terms = {
             'te': {
                 # Politics and governance
-                'ప్రధానమంత్రి': 3.0, 'మంత్రి': 2.5, 'అధ్యక్షుడు': 3.0, 'నेता': 2.0,
+                'ప్రధానమంత్రి': 3.0, 'మంత్రి': 2.5, 'అధ్యక్షుడు': 3.0, 'నేత': 2.0,
                 'ప్రభుత్వం': 2.5, 'రాజకీయ': 2.0, 'ఎన్నికలు': 2.5, 'పార్లమెంట్': 2.5,
                 'శాసనసభ': 2.5, 'న్యాయస్థానం': 2.5, 'న్యాయమూర్తి': 2.0,
                 
@@ -212,7 +214,7 @@ class StateOfTheArtIndicSummarizer:
         # Enhanced transition markers and discourse connectors
         self.connectors = {
             'te': {
-                'causal': ['కాబట్టি', 'అందువలన', 'దీనివలన', 'ఎందుకంటే', 'కారణంగా'],
+                'causal': ['కాబట్టి', 'అందువలన', 'దీనివలన', 'ఎందుకంటే', 'కారణంగా'],
                 'additive': ['అలాగే', 'అంతేకాకుండా', 'ఇంకా', 'పైగా', 'అదేవిధంగా', 'అదనంగా'],
                 'contrastive': ['అయితే', 'కానీ', 'మరోవైపు', 'అయినప్పటికీ', 'విరుద్ధంగా'],
                 'temporal': ['అప్పుడు', 'తర్వాత', 'ముందు', 'ఇంతలో', 'అంతలో', 'ఇప్పుడు'],
@@ -614,132 +616,439 @@ class StateOfTheArtIndicSummarizer:
                 return '. '.join(sentences[:sentence_count]) + '.'
             return text
 
+    def _indicbart_summarize(self, text: str, max_length: int) -> str:
+        """Use IndicBART for neural summarization with proper language handling"""
+        try:
+            # IndicBART language tokens for source and target
+            if self.lang_code == 'te':
+                source_lang = "<2te>"  # Telugu source
+                target_lang = "<2te>"  # Telugu target
+            else:
+                source_lang = "<2hi>"  # Hindi source  
+                target_lang = "<2hi>"  # Hindi target
+            
+            # Prepare input text - IndicBART expects source language token at start
+            input_text = f"{source_lang} {text}"
+            
+            # Tokenize with proper settings for IndicBART
+            inputs = self.indicbart_tokenizer(
+                input_text, 
+                return_tensors="pt", 
+                max_length=512, 
+                truncation=True,
+                padding=True
+            )
+            
+            # Move to device
+            input_ids = inputs['input_ids'].to(self.device)
+            attention_mask = inputs['attention_mask'].to(self.device)
+            
+            # Get target language token ID for generation
+            target_lang_id = self.indicbart_tokenizer.convert_tokens_to_ids(target_lang)
+            
+            # Generate summary with proper parameters for IndicBART
+            with torch.no_grad():
+                summary_ids = self.indicbart_model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_length=min(max_length // 2, 80),  # Conservative length
+                    min_length=10,
+                    num_beams=2,  # Reduced beams for faster generation
+                    early_stopping=True,
+                    do_sample=False,
+                    repetition_penalty=1.0,  # No repetition penalty to avoid issues
+                    length_penalty=1.0,
+                    decoder_start_token_id=target_lang_id,  # Force start with target language
+                    pad_token_id=self.indicbart_tokenizer.pad_token_id,
+                    eos_token_id=self.indicbart_tokenizer.eos_token_id
+                )
+            
+            # Decode summary with proper cleanup
+            summary = self.indicbart_tokenizer.decode(
+                summary_ids[0], 
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
+            
+            # Clean up the summary - remove language tokens and extra spaces
+            summary = summary.replace(source_lang, "").replace(target_lang, "").strip()
+            summary = re.sub(r'\s+', ' ', summary)  # Normalize spaces
+            
+            # Additional validation - ensure we have Telugu/Hindi text
+            if self.lang_code == 'te':
+                # Check if we have Telugu characters
+                telugu_chars = sum(1 for char in summary if 0x0C00 <= ord(char) <= 0x0C7F)
+                if telugu_chars < 3:  # If very few Telugu chars, something went wrong
+                    return ""
+            
+            return summary.strip()
+            
+        except Exception as e:
+            logger.error(f"IndicBART summarization failed: {e}")
+            return ""
+    
+    def _mt5_summarize(self, text: str, max_length: int) -> str:
+        """Use mT5 for neural summarization"""
+        try:
+            # Prepare input for mT5
+            input_text = f"summarize: {text}"
+            
+            # Tokenize
+            inputs = self.mt5_tokenizer.encode(
+                input_text, 
+                return_tensors="pt", 
+                max_length=512, 
+                truncation=True
+            )
+            inputs = inputs.to(self.device)
+            
+            # Generate summary
+            with torch.no_grad():
+                summary_ids = self.mt5_model.generate(
+                    inputs,
+                    max_length=min(max_length // 2, 150),
+                    min_length=20,
+                    num_beams=4,
+                    early_stopping=True,
+                    do_sample=False,
+                    repetition_penalty=1.2
+                )
+            
+            # Decode summary
+            summary = self.mt5_tokenizer.decode(
+                summary_ids[0], 
+                skip_special_tokens=True
+            )
+            
+            return summary.strip()
+            
+        except Exception as e:
+            logger.error(f"mT5 summarization failed: {e}")
+            return ""
+    
+    def _enhanced_extractive_summarize(self, sentences: List[str], max_length: int) -> str:
+        """Enhanced extractive summarization that creates more abstractive-like summaries"""
+        try:
+            if not sentences:
+                return ""
+            
+            # For very short texts, try to create a condensed version
+            if len(sentences) <= 2:
+                # For short texts, take key phrases and combine them intelligently
+                return self._create_condensed_summary(sentences, max_length)
+            
+            # Score sentences but focus on different types of content
+            sentence_scores = self._score_sentences(sentences)
+            
+            # Categorize sentences by type
+            opening_sentences = []  # Definitions, introductions
+            detail_sentences = []   # Examples, explanations
+            closing_sentences = []  # Conclusions, outcomes
+            
+            for i, sentence in enumerate(sentences):
+                sentence_lower = sentence.lower()
+                
+                # Opening/definition sentences
+                if any(word in sentence_lower for word in ['అనేది', 'అనే', 'అని', 'అందుకే', 'కారణంగా']):
+                    opening_sentences.append((i, sentence_scores.get(i, 0)))
+                
+                # Detail/example sentences  
+                elif any(word in sentence_lower for word in ['ఉదాహరణకు', 'అలాగే', 'మరియు', 'కూడా', 'లాంటి']):
+                    detail_sentences.append((i, sentence_scores.get(i, 0)))
+                
+                # Closing/conclusion sentences
+                elif any(word in sentence_lower for word in ['చివరగా', 'కాబట్టి', 'అందువల్ల', 'నిలిచింది', 'మారింది']):
+                    closing_sentences.append((i, sentence_scores.get(i, 0)))
+                
+                else:
+                    # Default to detail sentences
+                    detail_sentences.append((i, sentence_scores.get(i, 0)))
+            
+            # Sort each category by score
+            opening_sentences.sort(key=lambda x: x[1], reverse=True)
+            detail_sentences.sort(key=lambda x: x[1], reverse=True)
+            closing_sentences.sort(key=lambda x: x[1], reverse=True)
+            
+            # Select sentences strategically
+            selected_indices = []
+            total_length = 0
+            
+            # Always include the best opening sentence if available
+            if opening_sentences and total_length < max_length * 0.4:
+                idx, score = opening_sentences[0]
+                if total_length + len(sentences[idx]) < max_length:
+                    selected_indices.append(idx)
+                    total_length += len(sentences[idx])
+            
+            # Add one good detail sentence
+            if detail_sentences and total_length < max_length * 0.7:
+                for idx, score in detail_sentences:
+                    if idx not in selected_indices and total_length + len(sentences[idx]) < max_length:
+                        selected_indices.append(idx)
+                        total_length += len(sentences[idx])
+                        break
+            
+            # Add closing sentence if space allows
+            if closing_sentences and total_length < max_length * 0.8:
+                for idx, score in closing_sentences:
+                    if idx not in selected_indices and total_length + len(sentences[idx]) < max_length:
+                        selected_indices.append(idx)
+                        total_length += len(sentences[idx])
+                        break
+            
+            # Fill remaining space with high-scoring sentences
+            all_scored = [(i, sentence_scores.get(i, 0)) for i in range(len(sentences))]
+            all_scored.sort(key=lambda x: x[1], reverse=True)
+            
+            for idx, score in all_scored:
+                if idx not in selected_indices and len(selected_indices) < 4:
+                    if total_length + len(sentences[idx]) < max_length:
+                        selected_indices.append(idx)
+                        total_length += len(sentences[idx])
+            
+            # Ensure we have at least one sentence
+            if not selected_indices:
+                selected_indices = [0]
+            
+            # Sort selected indices to maintain order
+            selected_indices.sort()
+            
+            # Extract selected sentences and create natural flow
+            selected_sentences = [sentences[i] for i in selected_indices]
+            
+            # Join with appropriate connectors for better flow
+            if len(selected_sentences) == 1:
+                result = selected_sentences[0]
+            elif len(selected_sentences) == 2:
+                result = f"{selected_sentences[0]} {selected_sentences[1]}"
+            else:
+                # For multiple sentences, add minimal connectors
+                result = selected_sentences[0]
+                for i in range(1, len(selected_sentences)):
+                    # Add natural connectors based on content
+                    if i == len(selected_sentences) - 1:
+                        # Last sentence
+                        result += f" {selected_sentences[i]}"
+                    else:
+                        # Middle sentences
+                        result += f" {selected_sentences[i]}"
+            
+            return result.strip()
+            
+        except Exception as e:
+            logger.error(f"Enhanced extractive summarization failed: {e}")
+            # Fallback to simple approach
+            return '. '.join(sentences[:2]) + '.' if sentences else ""
+    
+    def _create_condensed_summary(self, sentences: List[str], max_length: int) -> str:
+        """Create a condensed summary for very short texts"""
+        if not sentences:
+            return ""
+        
+        # For single sentence, return as-is if it fits
+        if len(sentences) == 1:
+            if len(sentences[0]) <= max_length:
+                return sentences[0]
+            else:
+                # Carefully truncate at word boundary
+                words = sentences[0].split()
+                result = ""
+                for word in words:
+                    if len(result + " " + word) <= max_length - 3:
+                        result += (" " + word) if result else word
+                    else:
+                        break
+                return result + "..." if result else sentences[0][:max_length-3] + "..."
+        
+        # For two sentences, try to combine key information
+        combined = f"{sentences[0]} {sentences[1]}"
+        if len(combined) <= max_length:
+            return combined
+        else:
+            # Take the first sentence if it fits, otherwise truncate
+            if len(sentences[0]) <= max_length:
+                return sentences[0]
+            else:
+                return self._create_condensed_summary([sentences[0]], max_length)
+    
+    def _get_sentence_topic(self, sentence: str) -> str:
+        """Extract topic from sentence for diversity checking"""
+        words = self._tokenize_words(sentence)
+        stopwords = self.stopwords.get(self.lang_code, set())
+        
+        # Get content words (non-stopwords)
+        content_words = [w for w in words if w not in stopwords and len(w) > 2]
+        
+        # Return first 2 content words as topic
+        return "_".join(content_words[:2]) if content_words else "unknown"
+    
+    def _get_sentence_key_terms(self, sentence: str) -> set:
+        """Extract key terms from sentence for improved diversity checking"""
+        words = self._tokenize_words(sentence)
+        stopwords = self.stopwords.get(self.lang_code, set())
+        
+        # Get content words (non-stopwords) that are meaningful
+        key_terms = set()
+        for word in words:
+            if (word not in stopwords and 
+                len(word) > 2 and 
+                not word.isdigit() and
+                not all(ord(c) < 128 for c in word)):  # Keep non-ASCII (Telugu/Hindi) words
+                key_terms.add(word.lower())
+        
+        return key_terms
+    
+    def _smart_trim_to_length(self, text: str, max_length: int) -> str:
+        """Intelligently trim text to max_length while respecting sentence boundaries"""
+        if len(text) <= max_length:
+            return text
+        
+        # Split into sentences
+        sentences = self._preprocess_text(text)
+        if not sentences:
+            return text[:max_length]
+        
+        # Build summary sentence by sentence until we hit the limit
+        result_sentences = []
+        total_length = 0
+        
+        for sentence in sentences:
+            sentence_with_period = sentence.strip()
+            if not sentence_with_period.endswith('.'):
+                sentence_with_period += '.'
+            
+            # Check if adding this sentence would exceed limit
+            addition_length = len(sentence_with_period) + (1 if result_sentences else 0)  # +1 for space
+            if total_length + addition_length <= max_length:
+                result_sentences.append(sentence_with_period)
+                total_length += addition_length
+            else:
+                break
+        
+        if result_sentences:
+            return ' '.join(result_sentences)
+        else:
+            # If even first sentence is too long, do careful truncation
+            first_sentence = sentences[0].strip()
+            if len(first_sentence) > max_length:
+                # Find last space before max_length
+                truncate_pos = max_length - 3  # Leave room for "..."
+                while truncate_pos > 0 and first_sentence[truncate_pos] != ' ':
+                    truncate_pos -= 1
+                if truncate_pos > max_length // 2:  # Only if we found a good break point
+                    return first_sentence[:truncate_pos] + "..."
+                else:
+                    return first_sentence[:max_length-3] + "..."
+            else:
+                return first_sentence
+    
+    def _select_important_sentences(self, sentences: List[str], max_length: int) -> List[str]:
+        """Last resort: manual selection of important sentences"""
+        if not sentences:
+            return []
+        
+        # For very short inputs, return first sentence
+        if len(sentences) == 1:
+            return [sentences[0]]
+        
+        # Select first, middle, and last sentences for variety
+        selected = []
+        total_len = 0
+        
+        # Always include first sentence (usually important)
+        if sentences and total_len + len(sentences[0]) < max_length:
+            selected.append(sentences[0])
+            total_len += len(sentences[0])
+        
+        # Include last sentence if there's room
+        if len(sentences) > 1 and total_len + len(sentences[-1]) + 20 < max_length:
+            selected.append(sentences[-1])
+            total_len += len(sentences[-1])
+        
+        # Include middle sentence if there's room and we have more than 2 sentences
+        if len(sentences) > 2:
+            mid_idx = len(sentences) // 2
+            if total_len + len(sentences[mid_idx]) + 20 < max_length:
+                # Insert middle sentence between first and last
+                if len(selected) == 2:
+                    selected.insert(1, sentences[mid_idx])
+                else:
+                    selected.append(sentences[mid_idx])
+        
+        return selected
+
     def summarize(self, text: str, max_length: int = 250) -> Tuple[str, str]:
-        """Main summarization method: extract, then always neural enhance for abstraction"""
+        """Main summarization method with optimized strategy based on quality"""
         try:
             self.lang_code = self.detect_language(text)
+            logger.info(f"Detected language: {self.lang_code}")
+            
+            # Preprocess and get sentences
             sentences = self._preprocess_text(text)
             if not sentences:
                 return "సారాంశం అందుబాటులో లేదు.", "error"
-            if len(sentences) == 1:
-                compressed = self._compress_sentence(sentences[0], aggressive=False)
-                if len(compressed) > max_length:
-                    compressed = compressed[:max_length-3] + "..."
-                # Fallback: neural enhancement if available, else extractive single
-                if self.neural_model_available:
-                    summary = self.generate_neural_enhancement(compressed)
-                    return summary[:max_length], "neural_single"
-                else:
-                    return compressed[:max_length], "extractive_single"            # Improved sentence selection with better logic
-            sentence_scores = self._score_sentences(sentences)
-            scored = sorted(((i, s) for i, s in sentence_scores.items()), key=lambda x: x[1], reverse=True)
             
-            # Select sentences more intelligently
-            selected = []
-            used = set()
-            total_len = 0
+            logger.info(f"Processing {len(sentences)} sentences")
             
-            # First pass: get the highest scoring sentences that fit
-            for idx, score in scored:
-                if idx in used:
-                    continue
-                    
-                sentence = sentences[idx]
-                sentence_len = len(sentence)
+            # Strategy 1: Use improved extractive for now (neural models are broken)
+            # TODO: Fix IndicBART and mT5 models later - they output corrupted text
+            
+            # Strategy 1: Enhanced extractive summarization with better abstraction
+            # Use more generous length for extractive to allow multi-sentence summaries
+            extractive_max_length = max(max_length * 1.5, 300)  # At least 300 characters for good summaries
+            extractive_summary = self._enhanced_extractive_summarize(sentences, extractive_max_length)
+            
+            if extractive_summary and len(extractive_summary.strip()) > 20:
+                # Quality check: ensure it contains proper Telugu/Hindi characters
+                target_chars = 0x0C00 if self.lang_code == 'te' else 0x0900  # Telugu or Hindi range
+                script_chars = sum(1 for char in extractive_summary if ord(char) >= target_chars and ord(char) <= target_chars + 0x7F)
                 
-                # Skip if too similar to already selected sentences
-                skip_similar = False
-                for selected_sent in selected:
-                    # Simple similarity check
-                    common_words = set(sentence.split()) & set(selected_sent.split())
-                    if len(common_words) > min(len(sentence.split()), len(selected_sent.split())) * 0.6:
-                        skip_similar = True
-                        break
-                
-                if skip_similar:
-                    continue
-                
-                # Check if adding this sentence would exceed length
-                if total_len + sentence_len <= max_length * 0.8:  # Leave room for connectors
-                    selected.append(sentence)
-                    used.add(idx)
-                    total_len += sentence_len
-                    
-                    # Stop if we have enough content
-                    if len(selected) >= 3 or total_len >= max_length * 0.6:
-                        break
+                if script_chars >= 10:  # Sufficient target language content
+                    logger.info("Using enhanced extractive summarization")
+                    # Smart trim to requested max_length while respecting sentence boundaries
+                    final_summary = self._smart_trim_to_length(extractive_summary, max_length)
+                    return final_summary, f"enhanced_extractive_{self.lang_code}"
             
-            # If we don't have enough content, add more sentences
-            if len(selected) < 2 and len(sentences) > 1:
-                for idx, score in scored:
-                    if idx not in used:
-                        sentence = sentences[idx]
-                        if total_len + len(sentence) <= max_length:
-                            selected.append(sentence)
-                            used.add(idx)
-                            total_len += len(sentence)
-                            break
+            # Strategy 4: Return extractive even if quality check failed (better than nothing)
+            if extractive_summary and len(extractive_summary.strip()) > 10:
+                logger.info("Using extractive summarization (fallback)")
+                final_summary = self._smart_trim_to_length(extractive_summary, max_length)
+                return final_summary, f"extractive_fallback_{self.lang_code}"
             
-            # If still no selection, use the first sentence
-            if not selected and sentences:
-                selected = [sentences[0]]
+            # Strategy 5: Simple Sumy fallback
+            if SUMY_AVAILABLE:
+                try:
+                    sumy_summary = self._sumy_fallback(text, sentence_count=min(3, len(sentences)))
+                    if sumy_summary and len(sumy_summary.strip()) > 20:
+                        logger.info("Using Sumy fallback")
+                        final_summary = self._smart_trim_to_length(sumy_summary, max_length)
+                        return final_summary, f"sumy_fallback_{self.lang_code}"
+                except Exception as e:
+                    logger.warning(f"Sumy failed: {e}")
             
-            # Compress and merge selected sentences
-            compressed_sentences = [self._compress_sentence(s, aggressive=True) for s in selected]
-            merged = ' '.join(compressed_sentences)
-            # Robust summary selection: neural enhancement with fallback to extractive flow
-            if self.neural_model_available:
-                enhanced = self.generate_neural_enhancement(merged)
-                # Check if enhancement is effective
-                if enhanced == merged or len(enhanced.split()) < max(5, len(selected) // 2):
-                    logger.warning("Neural enhancement ineffective, falling back to extractive summary.")
-                    # Try Sumy fallback if available
-                    final_summary = self._sumy_fallback(' '.join(selected), sentence_count=len(selected))
-                    method = f"extractive_fallback_{self.lang_code}"
-                else:
-                    final_summary = enhanced
-                    method = f"neural_proper_slm_{self.lang_code}"
-            else:
-                logger.info("Neural model unavailable, using extractive summary.")
-                # Try Sumy fallback first
-                sumy_summary = self._sumy_fallback(merged, sentence_count=len(selected))
-                if sumy_summary and sumy_summary != merged and len(sumy_summary.strip()) > 10:
-                    final_summary = sumy_summary
-                    method = f"sumy_lexrank_{self.lang_code}"
-                else:
-                    # If Sumy fails, use the merged compressed sentences (better than truncation)
-                    final_summary = merged
-                    method = f"extractive_proper_slm_{self.lang_code}"
+            # Strategy 6: Last resort - manual selection
+            if sentences:
+                # Select the most informative sentences
+                important_sentences = self._select_important_sentences(sentences, max_length)
+                manual_summary = ' '.join(important_sentences)
+                final_summary = self._smart_trim_to_length(manual_summary, max_length)
+                logger.info("Using manual sentence selection")
+                return final_summary, f"manual_selection_{self.lang_code}"
             
-            # Smart truncation: cut at sentence boundary if too long
-            if len(final_summary) > max_length:
-                # Try to cut at sentence boundary
-                sentences_in_summary = final_summary.split('.')
-                truncated = ""
-                for sent in sentences_in_summary:
-                    if len(truncated + sent + ".") <= max_length - 3:
-                        truncated += sent + "."
-                    else:
-                        break
-                if len(truncated) > 20:  # If we got a reasonable truncation
-                    final_summary = truncated.strip()
-                else:
-                    # Fallback to character truncation
-                    final_summary = final_summary[:max_length-3] + '...'
+            return "సారాంశం అందుబాటులో లేదు.", "error"
             
-            return final_summary, method
         except Exception as e:
-            logger.error(f"SLM summarization error: {e}")
+            logger.error(f"Summarization error: {e}")
             return f"సారాంశం లోపం: {str(e)[:30]}...", "error"
 
 # Global instance
 _proper_slm_summarizer = None
 
-def get_proper_slm_summarizer() -> ProperSLMSummarizer:
+def get_proper_slm_summarizer() -> StateOfTheArtIndicSummarizer:
     """Get the proper SLM summarizer instance"""
     global _proper_slm_summarizer
     if _proper_slm_summarizer is None:
-        _proper_slm_summarizer = ProperSLMSummarizer()
+        _proper_slm_summarizer = StateOfTheArtIndicSummarizer()
     return _proper_slm_summarizer
 
 # Test the proper SLM implementation
@@ -751,7 +1060,7 @@ if __name__ == "__main__":
     aviation_text = """గత 24 గంటల్లో భారతదేశంతో సహా అంతర్జాతీయ విమానయాన రంగంలో మూడు పెద్ద విమాన ఘటనలు చోటు చేసుకున్నాయి, ఇవి ప్రయాణికుల్లో తీవ్ర ఆందోళనకు కారణమయ్యాయి. హాంకాంగ్ నుండి ఢిల్లీకి వస్తున్న ఎయిర్ ఇండియా బోయింగ్ 787 విమానంలో సాంకేతిక సమస్య తలెత్తడంతో, అది మధ్యలోనే మళ్లీ తిరిగి వెళ్లాల్సి వచ్చింది. ఇదే సమయంలో జర్మనీకి చెందిన లుఫ్తాన్సా విమానానికి బాంబు బెదిరింపు సందేశం రావడంతో వెంటనే తిరిగి ప్రయాణం రద్దుచేసింది. ఇక కేరళలో బ్రిటిష్ ఫైటర్ జెట్ ఒకటి తక్కువ ఇంధనం కారణంగా అత్యవసరంగా ల్యాండ్ కావాల్సి వచ్చింది. ఈ మూడు ఘటనలు కూడా ప్రయాణికుల భద్రతపై తీవ్ర ఆందోళన కలిగించాయి. విమాన భద్రతా ప్రమాణాలపై ప్రజల్లో అనేక సందేహాలు మొదలయ్యాయి. విమానయాన సంస్థలు అత్యధిక జాగ్రత్తలు తీసుకోవాల్సిన అవసరం మరోసారి తేటతెల్లమైంది."""
     
     try:
-        summarizer = ProperSLMSummarizer()
+        summarizer = StateOfTheArtIndicSummarizer()
         summary, method = summarizer.summarize(aviation_text, max_length=250)
         
         print(f"Input length: {len(aviation_text)} characters")
